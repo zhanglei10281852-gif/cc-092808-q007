@@ -56,11 +56,12 @@ class CustodyService:
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
-                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
+                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,category,received_year,initial_quantity,"
                 "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                "VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
                 (
-                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"), data["received_year"],
+                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"),
+                    data.get("category") or "常规检材", data["received_year"],
                     data["initial_quantity"], data["initial_quantity"], data.get("integrity_percent"),
                     data.get("packaging", ""), data.get("sealed_on"), data["created_by"], timestamp, timestamp,
                 ),
@@ -198,6 +199,9 @@ class CustodyService:
         self.connection.execute(
             "UPDATE specimens SET status='held',version=version+1,updated_at=? WHERE id=? AND status NOT IN ('depleted','disposed')",
             (timestamp, specimen["id"]),
+        )
+        self.repository.invalidate_pending_disposal_items(
+            int(specimen["id"]), f"确认期间出现新的{data['hold_type']}冻结事件，销毁失效", timestamp,
         )
         return record(self.connection.execute("SELECT * FROM specimen_holds WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
 

@@ -31,6 +31,11 @@ from app.forensics.schemas import (
     ExaminationInvalidate,
     ExaminationStart,
     WithdrawalCreate,
+    RetentionPolicyCreate,
+    DisposalBatchGenerate,
+    DisposalDecisionBatch,
+    DisposalConfirm,
+    DisposalExecute,
 )
 from app.forensics.service import ForensicService
 
@@ -352,3 +357,76 @@ def decide_release(
 def release_detail(request_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("forensic_cases.read")
     return _service().repository.release_detail(request_id)
+
+
+@router.post("/retention-policies", status_code=201)
+def create_retention_policy(data: RetentionPolicyCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("disposal.write")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).disposal.create_policy(data.model_dump(mode="json"))
+
+
+@router.get("/retention-policies")
+def list_retention_policies(category: str | None = None, principal: Principal = Depends(current_principal)) -> list[dict]:
+    principal.require("disposal.read")
+    return _service().repository.list_retention_policies(category)
+
+
+@router.post("/disposal-batches", status_code=201)
+def generate_disposal_batch(data: DisposalBatchGenerate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("disposal.write")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).disposal.generate_batch(data.model_dump(mode="json"))
+
+
+@router.get("/disposal-batches")
+def list_disposal_batches(
+    status: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("disposal.read")
+    items, total = _service().repository.list_disposal_batches(status=status, limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/disposal-batches/{batch_id}")
+def disposal_batch_detail(batch_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("disposal.read")
+    return _service().repository.disposal_batch_detail(batch_id)
+
+
+@router.post("/disposal-batches/{batch_id}/decisions")
+def decide_disposal_items(
+    batch_id: int,
+    data: DisposalDecisionBatch,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("disposal.write")
+    payload = data.model_dump(mode="json")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).disposal.decide_items(batch_id, payload["decisions"], payload["actor"])
+
+
+@router.post("/disposal-batches/{batch_id}/items/{item_id}/confirm")
+def confirm_disposal_item(
+    batch_id: int,
+    item_id: int,
+    data: DisposalConfirm,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("disposal.confirm")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).disposal.confirm(batch_id, item_id, data.model_dump(mode="json"))
+
+
+@router.post("/disposal-batches/{batch_id}/execute")
+def execute_disposal_batch(
+    batch_id: int,
+    data: DisposalExecute,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("disposal.confirm")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).disposal.execute(batch_id, data.model_dump(mode="json"))

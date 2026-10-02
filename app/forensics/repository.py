@@ -12,6 +12,7 @@ JSON_COLUMNS = {
     "contact_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "exclusion_reasons_json": "exclusion_reasons",
 }
 
 
@@ -193,7 +194,6 @@ class ForensicRepository:
         if item is None:
             raise NotFoundError("领用申请不存在")
         return item
-
     def release_detail(self, request_id: int) -> dict[str, Any]:
         item = self.require_release(request_id)
         item["items"] = records(self.connection.execute(
@@ -202,10 +202,108 @@ class ForensicRepository:
         ).fetchall())
         return item
 
+    def require_retention_policy(self, policy_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM retention_policies WHERE id=?", (policy_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("保存策略不存在")
+        return item
+
+    def list_retention_policies(self, category: str | None = None) -> list[dict[str, Any]]:
+        if category:
+            rows = self.connection.execute(
+                "SELECT * FROM retention_policies WHERE specimen_category=? ORDER BY specimen_category,version", (category,)
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM retention_policies ORDER BY specimen_category,version"
+            ).fetchall()
+        return records(rows)
+
+    def applicable_retention_policy(self, category: str, on_date: str) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM retention_policies WHERE specimen_category=? AND effective_from<=? "
+            "AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
+            (category, on_date, on_date),
+        ).fetchone())
+
+    def require_disposal_batch(self, batch_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM disposal_batches WHERE id=?", (batch_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("处置批次不存在")
+        return item
+
+    def list_disposal_batches(self, *, status: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+        where = " WHERE status=?" if status else ""
+        params: list[Any] = [status] if status else []
+        total = int(self.connection.execute(f"SELECT COUNT(*) FROM disposal_batches{where}", params).fetchone()[0])
+        rows = self.connection.execute(
+            f"SELECT * FROM disposal_batches{where} ORDER BY id DESC LIMIT ? OFFSET ?", (*params, limit, offset)
+        ).fetchall()
+        return records(rows), total
+
+    def require_disposal_item(self, item_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM disposal_items WHERE id=?", (item_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("处置明细不存在")
+        return item
+
+    def disposal_batch_detail(self, batch_id: int) -> dict[str, Any]:
+        batch = self.require_disposal_batch(batch_id)
+        rows = records(self.connection.execute(
+            "SELECT i.*,c.case_no FROM disposal_items i JOIN forensic_cases c ON c.id=i.case_id "
+            "WHERE i.batch_id=? ORDER BY i.id", (batch_id,)
+        ).fetchall())
+        batch["items"] = [self._disposal_item_trace(row) for row in rows]
+        return batch
+
+    def active_disposal_extension(self, specimen_id: int, as_of_date: str) -> dict[str, Any] | None:
+        latest = self.latest_disposal_extension(specimen_id)
+        if latest is not None and str(latest["extend_to"]) >= as_of_date:
+            return latest
+        return None
+
+    def latest_disposal_extension(self, specimen_id: int) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM disposal_extensions WHERE specimen_id=? ORDER BY version DESC LIMIT 1", (specimen_id,)
+        ).fetchone())
+
+    def invalidate_pending_disposal_items(self, specimen_id: int, reason: str, timestamp: str) -> int:
+        cursor = self.connection.execute(
+            "UPDATE disposal_items SET disposition='invalidated',decision_note=?,updated_at=? "
+            "WHERE specimen_id=? AND disposition='destruction_pending'",
+            (reason, timestamp, specimen_id),
+        )
+        return int(cursor.rowcount)
+
+    def _disposal_item_trace(self, item: dict[str, Any]) -> dict[str, Any]:
+        trace = dict(item)
+        trace["basis"] = {
+            "specimen_category": item["specimen_category"],
+            "case_closed_on": item["case_closed_on"],
+            "policy_id": item["policy_id"],
+            "policy_version": item["policy_version"],
+            "retention_months": item["retention_months"],
+            "retention_due_on": item["retention_due_on"],
+            "specimen_status": item["specimen_status"],
+            "specimen_version": item["specimen_version"],
+        }
+        trace["decision"] = {
+            "decided_by": item["decided_by"],
+            "decided_at": item["decided_at"],
+            "note": item["decision_note"],
+            "extension_id": item["extension_id"],
+        }
+        trace["confirmations"] = {
+            "custodian": {"actor": item["custodian_confirmed_by"], "confirmed_at": item["custodian_confirmed_at"]},
+            "supervisor": {"actor": item["supervisor_confirmed_by"], "confirmed_at": item["supervisor_confirmed_at"]},
+        }
+        trace["result"] = {"destroyed_at": item["destroyed_at"], "custody_event_id": item["custody_event_id"]}
+        return trace
+
     def count_table(self, table: str) -> int:
         allowed = {
             "forensic_cases", "specimens", "storage_locations", "examinations",
-            "review_schedules", "quality_alerts", "release_requests",
+            "review_schedules", "quality_alerts", "release_requests", "disposal_batches",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS specimens (
     specimen_no TEXT NOT NULL UNIQUE,
     case_id INTEGER NOT NULL REFERENCES forensic_cases(id) ON DELETE RESTRICT,
     parent_specimen_id INTEGER REFERENCES specimens(id),
+    category TEXT NOT NULL DEFAULT '常规检材',
     received_year INTEGER NOT NULL CHECK(received_year BETWEEN 1800 AND 2200),
     initial_quantity REAL NOT NULL CHECK(initial_quantity > 0),
     available_quantity REAL NOT NULL CHECK(available_quantity >= 0),
@@ -375,6 +376,74 @@ CREATE TABLE IF NOT EXISTS release_items (
     status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','allocated','fulfilled','unavailable')),
     UNIQUE(request_id,case_id)
 );
+CREATE TABLE IF NOT EXISTS retention_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_category TEXT NOT NULL,
+    retention_months INTEGER NOT NULL CHECK(retention_months > 0),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    version INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(specimen_category,version)
+);
+CREATE TABLE IF NOT EXISTS disposal_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no TEXT NOT NULL UNIQUE,
+    as_of_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','executed')),
+    generated_by TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS disposal_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL,
+    extend_to TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decided_by TEXT NOT NULL,
+    batch_id INTEGER REFERENCES disposal_batches(id),
+    item_id INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(specimen_id,version)
+);
+CREATE TABLE IF NOT EXISTS disposal_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES disposal_batches(id) ON DELETE CASCADE,
+    specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE RESTRICT,
+    specimen_no TEXT NOT NULL,
+    specimen_category TEXT NOT NULL,
+    case_id INTEGER NOT NULL REFERENCES forensic_cases(id),
+    case_closed_on TEXT,
+    policy_id INTEGER REFERENCES retention_policies(id),
+    policy_version INTEGER,
+    retention_months INTEGER,
+    retention_due_on TEXT,
+    specimen_status TEXT NOT NULL,
+    specimen_version INTEGER NOT NULL,
+    disposition TEXT NOT NULL DEFAULT 'candidate' CHECK(disposition IN
+        ('candidate','excluded','retained','extended','destruction_pending','conflict','invalidated','destroyed')),
+    exclusion_reasons_json TEXT NOT NULL DEFAULT '[]',
+    decision_note TEXT,
+    decided_by TEXT,
+    decided_at TEXT,
+    extension_id INTEGER REFERENCES disposal_extensions(id),
+    confirmation_started_at TEXT,
+    custodian_confirmed_by TEXT,
+    custodian_confirmed_at TEXT,
+    supervisor_confirmed_by TEXT,
+    supervisor_confirmed_at TEXT,
+    destroyed_at TEXT,
+    custody_event_id INTEGER REFERENCES custody_events(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(batch_id,specimen_id)
+);
+CREATE INDEX IF NOT EXISTS idx_disposal_items_batch ON disposal_items(batch_id,disposition);
+CREATE INDEX IF NOT EXISTS idx_disposal_items_specimen ON disposal_items(specimen_id,disposition);
+CREATE INDEX IF NOT EXISTS idx_disposal_extensions_active ON disposal_extensions(specimen_id,extend_to);
 CREATE TABLE IF NOT EXISTS outbox_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL UNIQUE,
@@ -411,6 +480,9 @@ PERMISSIONS = [
     ("examination.write", "执行检验任务", "examination", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
     ("release.approve", "审批鉴定领用", "release", "approve"),
+    ("disposal.read", "查看处置清单", "disposal", "read"),
+    ("disposal.write", "维护处置清单", "disposal", "write"),
+    ("disposal.confirm", "确认销毁执行", "disposal", "confirm"),
 ]
 
 
@@ -468,10 +540,17 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if existing and column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_column(connection, "specimens", "category", "TEXT NOT NULL DEFAULT '常规检材'")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -495,10 +574,12 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["forensic_cases.read", "forensic_cases.write", "custody.read", "custody.write"],
+            "registrar": ["forensic_cases.read", "forensic_cases.write", "custody.read", "custody.write",
+                          "disposal.read", "disposal.write", "disposal.confirm"],
             "technician": ["forensic_cases.read", "custody.read", "examination.read", "examination.write"],
-            "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve"],
-            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read"],
+            "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve",
+                        "disposal.read", "disposal.confirm"],
+            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read", "disposal.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
