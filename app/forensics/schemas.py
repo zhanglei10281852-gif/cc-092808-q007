@@ -125,6 +125,7 @@ class SpecimenCreate(BaseModel):
     specimen_no: str = Field(min_length=3, max_length=60)
     case_id: int = Field(gt=0)
     parent_specimen_id: int | None = Field(default=None, gt=0)
+    specimen_category: str = Field(default="", max_length=60)
     received_year: int = Field(ge=1800, le=2200)
     initial_quantity: float = Field(gt=0, le=10_000_000)
     integrity_percent: float | None = Field(default=None, ge=0, le=100)
@@ -136,6 +137,11 @@ class SpecimenCreate(BaseModel):
     @classmethod
     def normalize_specimen_no(cls, value: str) -> str:
         return value.strip().upper()
+
+    @field_validator("specimen_category")
+    @classmethod
+    def strip_category(cls, value: str) -> str:
+        return value.strip()
 
 
 class PlacementCreate(BaseModel):
@@ -302,3 +308,69 @@ class Page(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class RetentionPolicyCreate(BaseModel):
+    policy_code: str = Field(min_length=2, max_length=60)
+    specimen_category: str = Field(min_length=1, max_length=60)
+    discipline: str = Field(min_length=1, max_length=100)
+    retention_months: int = Field(gt=0, le=1200)
+    effective_from: date
+    effective_to: date | None = None
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @field_validator("policy_code", "specimen_category")
+    @classmethod
+    def strip_code(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "RetentionPolicyCreate":
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValueError("策略失效日期不能早于生效日期")
+        return self
+
+
+class RetentionExtensionCreate(BaseModel):
+    specimen_id: int = Field(gt=0)
+    extension_months: int = Field(gt=0, le=1200)
+    reason: str = Field(min_length=2, max_length=500)
+    decided_by: str = Field(min_length=1, max_length=100)
+
+
+class DisposalBatchCreate(BaseModel):
+    batch_no: str | None = Field(default=None, min_length=3, max_length=60)
+    as_of: date | None = None
+    specimen_category: str | None = Field(default=None, max_length=60)
+    case_id: int | None = Field(default=None, gt=0)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @field_validator("batch_no", "specimen_category")
+    @classmethod
+    def strip_optional(cls, value: str | None) -> str | None:
+        return value.strip() if value else value
+
+
+class DisposalDecisionItem(BaseModel):
+    candidate_id: int = Field(gt=0)
+    decision: str = Field(pattern="^(retain|extend|destroy)$")
+    reason: str = Field(default="", max_length=500)
+    extension_months: int = Field(default=0, ge=0, le=1200)
+
+
+class DisposalDecisions(BaseModel):
+    decisions: list[DisposalDecisionItem] = Field(min_length=1, max_length=1000)
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class DisposalSubmit(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class DisposalConfirm(BaseModel):
+    role: str = Field(pattern="^(custodian|supervisor)$")
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class DisposalExecute(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)

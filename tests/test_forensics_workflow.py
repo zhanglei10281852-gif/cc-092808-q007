@@ -30,7 +30,7 @@ def create_stored_lot(service: ForensicService, suffix: str = "001") -> tuple[di
     })
     specimen = service.custody.create_specimen({
         "specimen_no": f"SP-{suffix}", "case_id": forensic_case["id"], "parent_specimen_id": None,
-        "received_year": 2026, "initial_quantity": 500, "integrity_percent": 100,
+        "specimen_category": "生物检材", "received_year": 2026, "initial_quantity": 500, "integrity_percent": 100,
         "packaging": "防拆封袋，封识完整", "sealed_on": "2026-09-02", "created_by": "登记员",
     })
     placed = service.custody.place_specimen({

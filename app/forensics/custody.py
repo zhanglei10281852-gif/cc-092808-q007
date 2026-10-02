@@ -56,11 +56,12 @@ class CustodyService:
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
-                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
-                "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,specimen_category,received_year,"
+                "initial_quantity,available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
                 (
-                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"), data["received_year"],
+                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"),
+                    data.get("specimen_category", ""), data["received_year"],
                     data["initial_quantity"], data["initial_quantity"], data.get("integrity_percent"),
                     data.get("packaging", ""), data.get("sealed_on"), data["created_by"], timestamp, timestamp,
                 ),

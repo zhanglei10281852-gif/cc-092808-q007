@@ -12,6 +12,9 @@ JSON_COLUMNS = {
     "contact_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "basis_json": "basis",
+    "conflict_json": "conflict",
+    "result_json": "result",
 }
 
 
@@ -206,6 +209,7 @@ class ForensicRepository:
         allowed = {
             "forensic_cases", "specimens", "storage_locations", "examinations",
             "review_schedules", "quality_alerts", "release_requests",
+            "disposal_batches", "disposal_candidates", "retention_policies",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

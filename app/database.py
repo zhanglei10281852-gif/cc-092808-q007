@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS specimens (
     specimen_no TEXT NOT NULL UNIQUE,
     case_id INTEGER NOT NULL REFERENCES forensic_cases(id) ON DELETE RESTRICT,
     parent_specimen_id INTEGER REFERENCES specimens(id),
+    specimen_category TEXT NOT NULL DEFAULT '',
     received_year INTEGER NOT NULL CHECK(received_year BETWEEN 1800 AND 2200),
     initial_quantity REAL NOT NULL CHECK(initial_quantity > 0),
     available_quantity REAL NOT NULL CHECK(available_quantity >= 0),
@@ -392,6 +393,101 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+
+CREATE TABLE IF NOT EXISTS retention_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_code TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    specimen_category TEXT NOT NULL,
+    discipline TEXT NOT NULL,
+    retention_months INTEGER NOT NULL CHECK(retention_months > 0),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(policy_code,version)
+);
+CREATE INDEX IF NOT EXISTS idx_retention_lookup
+    ON retention_policies(specimen_category,discipline,effective_from);
+CREATE TABLE IF NOT EXISTS specimen_retention_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    extension_months INTEGER NOT NULL CHECK(extension_months > 0),
+    reason TEXT NOT NULL,
+    decided_by TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    UNIQUE(specimen_id,version)
+);
+CREATE INDEX IF NOT EXISTS idx_retention_extensions_lot ON specimen_retention_extensions(specimen_id,version);
+CREATE TABLE IF NOT EXISTS disposal_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK(status IN ('draft','submitted','confirmed','executed','cancelled')),
+    as_of TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    submitted_by TEXT,
+    submitted_at TEXT,
+    custodian_confirmed_by TEXT,
+    custodian_confirmed_at TEXT,
+    supervisor_confirmed_by TEXT,
+    supervisor_confirmed_at TEXT,
+    executed_by TEXT,
+    executed_at TEXT,
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS disposal_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES disposal_batches(id) ON DELETE CASCADE,
+    specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL
+        CHECK(status IN ('candidate','excluded','retained','extended','conflicted','queued','invalid','destroyed')),
+    exclusion_reason TEXT NOT NULL DEFAULT '',
+    decision TEXT CHECK(decision IN ('retain','extend','destroy')),
+    decision_reason TEXT NOT NULL DEFAULT '',
+    decided_by TEXT,
+    decided_at TEXT,
+    specimen_no TEXT NOT NULL,
+    case_id INTEGER NOT NULL,
+    case_no TEXT NOT NULL,
+    specimen_category TEXT NOT NULL DEFAULT '',
+    discipline TEXT NOT NULL DEFAULT '',
+    case_closed_on TEXT,
+    policy_id INTEGER REFERENCES retention_policies(id),
+    policy_version INTEGER,
+    retention_months INTEGER,
+    base_due_on TEXT,
+    extension_months INTEGER NOT NULL DEFAULT 0,
+    due_on TEXT,
+    basis_json TEXT NOT NULL DEFAULT '{}',
+    snapshot_version INTEGER NOT NULL,
+    snapshot_status TEXT NOT NULL,
+    conflict_code TEXT NOT NULL DEFAULT '',
+    conflict_json TEXT NOT NULL DEFAULT '{}',
+    conflict_at TEXT,
+    invalidated_at TEXT,
+    invalid_reason TEXT NOT NULL DEFAULT '',
+    destroyed_at TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(batch_id,specimen_id)
+);
+CREATE INDEX IF NOT EXISTS idx_disposal_candidates_batch ON disposal_candidates(batch_id,status);
+CREATE TABLE IF NOT EXISTS disposal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES disposal_batches(id) ON DELETE CASCADE,
+    candidate_id INTEGER REFERENCES disposal_candidates(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disposal_events_batch ON disposal_events(batch_id,id);
 '''
 
 PERMISSIONS = [
@@ -411,6 +507,10 @@ PERMISSIONS = [
     ("examination.write", "执行检验任务", "examination", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
     ("release.approve", "审批鉴定领用", "release", "approve"),
+    ("retention.write", "维护检材保存策略", "retention", "write"),
+    ("disposal.read", "查看到期处置", "disposal", "read"),
+    ("disposal.manage", "编报到期处置清单", "disposal", "manage"),
+    ("disposal.execute", "确认并执行检材销毁", "disposal", "execute"),
 ]
 
 
@@ -468,10 +568,20 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    """为旧版本数据库补齐新增列（CREATE TABLE IF NOT EXISTS 不会改动既有表）。"""
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(specimens)").fetchall()
+    }
+    if "specimen_category" not in columns:
+        connection.execute("ALTER TABLE specimens ADD COLUMN specimen_category TEXT NOT NULL DEFAULT ''")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _apply_column_migrations(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -482,6 +592,7 @@ def init_db() -> None:
             ("registrar", "检材登记员", "登记案件检材并维护保管信息"),
             ("technician", "鉴定技术员", "执行取样与专业检验"),
             ("curator", "案件审核员", "复核鉴定质量与领用"),
+            ("archivist", "档案管理员", "编报到期处置清单并组织销毁"),
             ("auditor", "审计查看员", "只读查看业务和审计记录"),
         ]
         for code, name, description in roles:
@@ -497,8 +608,12 @@ def init_db() -> None:
         role_permissions = {
             "registrar": ["forensic_cases.read", "forensic_cases.write", "custody.read", "custody.write"],
             "technician": ["forensic_cases.read", "custody.read", "examination.read", "examination.write"],
-            "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve"],
-            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read"],
+            "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve", "disposal.read"],
+            "archivist": [
+                "forensic_cases.read", "custody.read", "examination.read",
+                "retention.write", "disposal.read", "disposal.manage", "disposal.execute",
+            ],
+            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read", "disposal.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
